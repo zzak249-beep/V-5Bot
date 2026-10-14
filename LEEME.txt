@@ -1,0 +1,57 @@
+WYCKOFF BOT 4.5.0  (cambios sobre tu 4.4/4.3.3)
+
+ARCHIVOS QUE CAMBIAN / SE AÑADEN (sube SOLO estos; sobrescribe los del mismo nombre)
+  main.py  config.py  notify.py        modificados
+  edge.py                               NUEVO (marcador bayesiano y etiquetas)
+  test_edge.py  test_live.py            tests (test_edge es nuevo; test_live tiene 7 pruebas más)
+  railway.env                           plantilla de variables v2 (Variables -> Raw Editor)
+  ESTRATEGIA.md  LEEME.txt              documentación
+NO TOCAR: bingx.py, universe.py, strategy.py, wyckoff_engine.py, backtest.py, sweep.py, requirements.txt
+(strategy.py y el motor no cambian: backtest y sweep miden exactamente lo mismo que antes).
+
+POR QUÉ DABA POCAS SEÑALES Y SE PARABA  (diagnosis con tu railway.env y tus capturas)
+  1. Universo: UNIVERSE=top, AUTO_TOP_N=20, MIN_QUOTE_VOL=20M, solo cripto -> 15 símbolos, y un solo TF (15m).
+  2. MAX_CONCURRENT=1 y MAX_TOTAL_POSITIONS=1: MAX_TOTAL_POSITIONS cuenta TODAS las posiciones de la CUENTA.
+     Si P12, v5, BOT5.3 o QF3 comparten la cuenta de BingX, basta que otro bot tenga una posición abierta para que
+     este bot descarte la señal ("máximo de la cuenta"). Es muy probable que te esté pasando.
+  3. PAUSADO: MAX_LOSS_STREAK=4 y la pausa solo se quitaba a mano. Con tu acierto (33%) cuatro pérdidas seguidas
+     salen en 1 de cada 3 rachas de 6 operaciones y en el 85% de las de 20, solo por varianza. Por eso se para.
+
+QUÉ HACE LA 4.5
+  A) Pausas que no paran el bot
+     - Racha de pérdidas: pausa de STREAK_COOLDOWN_H (3 h) y vuelve sola.
+     - Drawdown: pausa de DD_COOLDOWN_H (12 h); al volver, el máximo de equity se reinicia.
+     - Al volver sola entra en MODO RECUPERACIÓN: riesgo x0.5 hasta 1 ganadora (máx. 4 operaciones).
+     - Freno: tras 3 reanudaciones automáticas en 7 días (AUTO_RESUME_MAX_7D) la siguiente pausa es solo manual.
+     - MIN_EQUITY_USDT (0 = off): suelo duro; por debajo de ese equity la pausa es SIEMPRE manual.
+     - /pausa y /cerrartodo SI siguen siendo manuales; /reanudar adelanta la reanudación y limpia la recuperación.
+  B) Más señales: plantilla railway.env v2 (120 símbolos con >=5M USDT/día, 15m + 1h, hasta 3 posiciones del bot,
+     máx. 2 en la misma dirección, tope de cuenta 6). Ajusta MAX_TOTAL_POSITIONS a TU política de riesgo.
+  C) LIBRO SOMBRA + MARCADOR BAYESIANO (la novedad)
+     - Cada señal que NO se abre (pausa, topes, pérdida diaria, trampas en aviso, silenciadas) se sigue como operación
+       virtual con la misma gestión y costes que el backtest. Se guarda en data/shadow.csv.
+     - Las que no se abren por motivos OPERATIVOS cuentan en el marcador; las que fallan por CALIDAD (R:R, stop...)
+       solo se registran por motivo, para no contaminar las estadísticas del setup.
+     - El marcador agrupa reales + sombra por setup, sesión, lado, contexto, tendencia, BTC y ADX, y encoge la media
+       hacia el a priori: media_posterior = (suma_R + n0*mu0)/(n + n0). Con pocas operaciones no se fía de la suerte.
+     - Sirve para MEDIR: cuánto te cuesta cada bloqueo (/sombra) y qué etiquetas funcionan (/edge).
+     - EDGE_MUTE=aviso (por defecto): avisa en la señal. =on: bloquea setups/sesiones con ventaja claramente negativa
+       (n>=20, posterior < -0.15R y t <= -1.5); como siguen en sombra, se levantan solos si se recuperan.
+     - EDGE_SIZING=off (por defecto): =on escala el riesgo entre x0.5 y x1.25 según el setup.
+  Comandos nuevos: /sombra  /edge   (el resumen diario y /estado incluyen la línea de sombra)
+
+PASOS
+  1. Sube los archivos listados (deja bingx.py y universe.py como están). Railway redespliega solo.
+  2. Variables: pega railway.env (Raw Editor) y vuelve a poner key, secret, token y chat id.
+  3. El bot sigue PAUSADO en su estado guardado: envía /reanudar una vez (limpia la pausa vieja).
+  4. Comprueba el primer mensaje: debe decir "pausa auto 3h · sombra on".
+  5. Cuando haya 20-30 operaciones sombra cerradas: /sombra y /edge. Decide con eso, no con una operación.
+  6. Antes de pasar nada a 'bloquea' o EDGE_MUTE=on, confírmalo con backtest.py / sweep.py como siempre.
+
+ADVERTENCIAS HONESTAS
+  - Nada de esto crea ventaja por sí solo: más universo y más TFs dan más señales, no mejores. El libro sombra
+    mide si esas señales extra valen la pena; si no, se quitan.
+  - Mirar muchos grupos produce falsos hallazgos por azar: solo setup y sesión pueden silenciar.
+  - La reanudación automática reduce una protección: por eso hay recuperación x0.5, tope de 3 en 7 días y suelo duro.
+  - Probado con tests y exchange simulado (test_engine, test_ind, test_edge, test_live: todo OK). No probado con la
+    API real de BingX ni con dinero. Empieza en BINGX_VST=true o con NOTIONAL_USDT pequeño.

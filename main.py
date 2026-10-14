@@ -9,6 +9,7 @@ Ciclo:
   · LIVE:   orden a mercado con el SL DENTRO de la orden + TP1 parcial + TP2; tras TP1, SL a breakeven;
             vigila en cada ciclo que la posición tenga stop y lo repone si falta
 """
+import html
 import json
 import logging
 import os
@@ -22,12 +23,12 @@ from datetime import datetime, timezone
 import requests
 
 import config as C
-from edge import EDGE_KEYS, edge_features, throttle_mult
-from bingx import BingX, BingXError
-from notify import Journal, Telegram
+from bingx import BingX, BingXError, BingXPaused
+from edge import Scoreboard, is_operational, labels_of, norm_reason
+from notify import SHADOW_FIELDS, Journal, Telegram
 from universe import is_tradfi
 from strategy import (FAIL_KIND, MetaModel, TradeSim, alignment, breadth_label, build_fail_signal, build_signal,
-                      context_of, ema_last, filters, flow_features, trend_dir, wyckoff_state)
+                      context_of, ema_last, filters, flow_features, ind_features, trend_dir, wyckoff_state)
 from wyckoff_engine import (BIT_CTEST, BIT_SOS, BIT_SOW, BIT_SPRING, BIT_TEST, BIT_UTAD, DIR_ACCUM, PHASE_C,
                             PHASE_D, PHASE_NAMES, WyckoffEngine, has_bit)
 
@@ -37,6 +38,7 @@ logging.basicConfig(level=getattr(logging, C.LOG_LEVEL.upper(), logging.INFO),
 log = logging.getLogger("main")
 
 STATE_PATH = os.path.join(C.DATA_DIR, "state.json")
+ROWS_KEEP = 700
 ALL_TFS = list(dict.fromkeys(C.TIMEFRAMES + ([C.CONTEXT_TF] if C.CONTEXT_TF else [])))
 
 
@@ -71,10 +73,15 @@ class Bot:
         self.ex = BingX(C.API_KEY, C.API_SECRET, C.VST)
         self.tg = Telegram(C.TG_TOKEN, C.TG_CHAT)
         self.journal = Journal(C.DATA_DIR)
+        self.shadow_log = Journal(C.DATA_DIR, "shadow.csv", SHADOW_FIELDS)
+        self._dirty = False
         self.pool = ThreadPoolExecutor(max_workers=max(1, C.FETCH_WORKERS))
         self.engines = {}          # (símbolo, tf) → motor
+        self.rows = {}             # (símbolo, tf) → últimas velas cerradas, para ADX / RSI / AVWAP
         self.symbols = []
         self.universe_ts = 0
+        self.paused_until = {}     # símbolo → epoch hasta el que no se le piden velas (contrato pausado)
+        self._block_alert = 0.0
         self.trend_cache = {}
         self.cooldown = {}
         self.running = True
@@ -105,13 +112,15 @@ class Bot:
     def load_state(self):
         base = {"positions": {}, "sims": {}, "daily": {"day": utc_day(), "r": 0.0, "n": 0},
                 "stats": {"n": 0, "wins": 0, "sum_r": 0.0, "gw": 0.0, "gl": 0.0},
-                "last_trade": time.time(), "idle_warned": False, "paused": False}
+                "last_trade": time.time(), "idle_warned": False, "paused": False, "streak": 0, "hwm": 0.0,
+                "shadow": {}, "score": {}, "pause_reason": "", "pause_until": 0.0,
+                "recovery": {"left": 0, "wins": 0}, "auto_resumes": []}
         try:
             with open(STATE_PATH) as f:
                 st = json.load(f)
             for k, v in base.items():
                 st.setdefault(k, v)
-            for rec in list(st["positions"].values()) + list(st["sims"].values()):
+            for rec in list(st["positions"].values()) + list(st["sims"].values()) + list(st["shadow"].values()):
                 rec.setdefault("tf", C.TIMEFRAME)
             return st
         except (OSError, ValueError):
@@ -134,30 +143,13 @@ class Bot:
         return (f"{st['n']} ops · acierto {self.wr()}% · media {avg:+.3f}R · total {st['sum_r']:+.2f}R · PF {pf}"
                 + (" (muestra pequeña: un dibujo, no evidencia)" if st["n"] < 30 else ""))
 
-    def verdict(self, rs):
-        """Juicio honesto del rendimiento acumulado (SIGNAL o LIVE): ¿la media es distinguible de cero?"""
-        import math
-        n = len(rs)
-        m = sum(rs) / n
-        sd = math.sqrt(sum((x - m) ** 2 for x in rs) / (n - 1)) if n > 1 else 0
-        t = m / (sd / math.sqrt(n)) if sd > 0 else 0
-        last = rs[-C.VERDICT_EVERY:]
-        ml = sum(last) / len(last)
-        if t >= 2 and m > 0:
-            v = "✅ ventaja positiva distinguible del azar (t≥2). Si es SIGNAL, candidato a LIVE con riesgo mínimo."
-        elif t <= -2:
-            v = "🛑 pierde de forma consistente (t≤−2). Para y revisa antes de seguir."
-        else:
-            v = "⏳ aún no distinguible de cero. Sigue midiendo."
-        self.tg.send(f"📐 <b>Veredicto tras {n} operaciones</b>\nmedia {m:+.3f}R · t {t:+.2f} · total {sum(rs):+.2f}R\n"
-                     f"últimas {len(last)}: media {ml:+.3f}R\n{v}")
-
     def roll_day(self):
         d = utc_day()
         if self.state["daily"]["day"] != d:
             old = self.state["daily"]
             self.tg.send(f"📅 <b>Resumen {old['day']}</b>\n{old['n']} cerradas · {old['r']:+.2f}R\n"
                          f"Acumulado: {self.stats_text()}\n"
+                         f"Libro sombra: {old.get('sh_n', 0)} cerradas · {old.get('sh_r', 0.0):+.2f}R (señales que no se abrieron)\n"
                          f"Compara la media por operación con la del backtest en los mismos símbolos.")
             self.state["daily"] = {"day": d, "r": 0.0, "n": 0}
             self.save_state()
@@ -173,16 +165,178 @@ class Bot:
         dl["n"] += 1
         self.state["last_trade"] = time.time()
         self.state["idle_warned"] = False
+        self.state["streak"] = 0 if r > 0 else self.state.get("streak", 0) + 1
+        rec = self.state.setdefault("recovery", {"left": 0, "wins": 0})
+        if rec.get("left", 0) > 0:  # modo recuperación: sale al conseguir las ganadoras pedidas o al agotar las operaciones
+            rec["left"] -= 1
+            rec["wins"] += 1 if r > 0 else 0
+            if rec["wins"] >= C.RECOVERY_WINS or rec["left"] == 0:
+                rec["left"] = 0
+                self.tg.send("🛟 Modo recuperación terminado: vuelve el riesgo normal.")
         self.save_state()
-        rs = self.state.setdefault("rs", [])
-        rs.append(round(r, 4))
-        self.save_state()
-        if C.VERDICT_EVERY > 0 and len(rs) % C.VERDICT_EVERY == 0:
-            self.verdict(rs)
+        if C.LIVE and C.MAX_LOSS_STREAK and self.state["streak"] >= C.MAX_LOSS_STREAK and not self.state["paused"]:
+            self.pause("racha", C.STREAK_COOLDOWN_H,
+                       f"{self.state['streak']} operaciones seguidas sin ganancia: bot PAUSADO (MAX_LOSS_STREAK).")
         if dl["r"] <= -C.MAX_DAILY_LOSS_R:
             self.tg.send(f"🛑 Pérdida diaria {dl['r']:+.2f}R ≥ {C.MAX_DAILY_LOSS_R}R: sin nuevas aperturas hasta 00:00 UTC.")
 
+    # ── v4.5: pausas que no paran el bot, libro sombra y marcador de ventaja ──
+    @property
+    def edge(self):
+        return Scoreboard(self.state["score"], C.EDGE_PRIOR_N, C.EDGE_PRIOR_MEAN_R)
+
+    def _set_pause(self, reason, cooldown_h):
+        """Activa la pausa. Devuelve True si queda SOLO manual (sin reanudación automática)."""
+        st, now = self.state, time.time()
+        st["auto_resumes"] = [t for t in st.get("auto_resumes", []) if now - t < 7 * 86400]
+        manual = (not C.AUTO_RESUME or cooldown_h <= 0 or reason in ("manual", "piso")
+                  or len(st["auto_resumes"]) >= C.AUTO_RESUME_MAX_7D)
+        st["paused"], st["pause_reason"] = True, reason
+        st["pause_until"] = 0.0 if manual else now + cooldown_h * 3600
+        self.save_state()
+        return manual
+
+    def pause(self, reason, cooldown_h, why):
+        manual = self._set_pause(reason, cooldown_h)
+        if not manual:
+            tail = (f"Se reanuda sola en {cooldown_h:g} h con el riesgo ×{C.RECOVERY_MULT:g} hasta ganar "
+                    f"{C.RECOVERY_WINS} (máx. {C.RECOVERY_MAX_TRADES} ops). /reanudar la adelanta.")
+        elif reason in ("racha", "drawdown") and C.AUTO_RESUME and cooldown_h > 0:
+            tail = (f"Ya hubo {C.AUTO_RESUME_MAX_7D} reanudaciones automáticas en 7 días: ahora solo manual, con /reanudar.")
+        else:
+            tail = "Reanuda con /reanudar."
+        self.tg.send(f"🛑 {why}\n{tail}")
+
+    def maybe_resume(self):
+        """Levanta sola la pausa por racha/drawdown cuando acaba su enfriamiento; entra en modo recuperación."""
+        st = self.state
+        if not st["paused"] or not st.get("pause_until") or time.time() < st["pause_until"]:
+            return
+        reason, eq = st.get("pause_reason", ""), None
+        if C.LIVE and reason == "drawdown":
+            try:
+                eq = self.ex.balance()[0]
+            except BingXError:
+                return  # se reintenta en el siguiente ciclo
+        st["paused"], st["pause_until"], st["streak"] = False, 0.0, 0
+        st["auto_resumes"] = [t for t in st.get("auto_resumes", []) if time.time() - t < 7 * 86400] + [time.time()]
+        st["recovery"] = {"left": C.RECOVERY_MAX_TRADES, "wins": 0}
+        if eq is not None:
+            st["hwm"] = eq  # el cortacircuitos vuelve a medir desde el equity actual
+        self.save_state()
+        self.tg.send(f"▶ <b>Reanudado solo</b> tras la pausa por {reason}. Modo recuperación: riesgo ×{C.RECOVERY_MULT:g} "
+                     f"hasta {C.RECOVERY_WINS} ganadora(s) o {C.RECOVERY_MAX_TRADES} ops. "
+                     f"({len(st['auto_resumes'])}/{C.AUTO_RESUME_MAX_7D} reanudaciones automáticas en 7 días)")
+
+    def pause_label(self):
+        st = self.state
+        if not st["paused"]:
+            return ""
+        why, until = st.get("pause_reason") or "manual", st.get("pause_until", 0.0)
+        if until:
+            return f" ⏸ PAUSADO ({why}, se reanuda en {max(0.0, (until - time.time()) / 3600):.1f} h)"
+        return f" ⏸ PAUSADO ({why}: /reanudar)"
+
+    def recovery_label(self):
+        left = (self.state.get("recovery") or {}).get("left", 0)
+        return f" 🛟 recuperación ×{C.RECOVERY_MULT:g} ({left} ops)" if left > 0 else ""
+
+    def risk_mult(self, sig):
+        """Multiplicador de tamaño: modo recuperación y (si EDGE_SIZING=on) ventaja posterior del setup."""
+        m, notes = 1.0, []
+        if (self.state.get("recovery") or {}).get("left", 0) > 0:
+            m *= C.RECOVERY_MULT
+            notes.append(f"recuperación ×{C.RECOVERY_MULT:g}")
+        if C.EDGE_SIZING == "on":
+            em = self.edge.size_mult(sig.get("labels") or labels_of(sig, time.time()),
+                                     C.EDGE_SIZING_K, C.EDGE_MULT_MIN, C.EDGE_MULT_MAX)
+            if abs(em - 1.0) > 0.005:
+                m *= em
+                notes.append(f"ventaja ×{em:.2f}")
+        return m, notes
+
+    NO_SHADOW = ("ya hay una operación en este símbolo", "la cuenta ya tiene posición", "no se pudo leer posiciones",
+                 "TradFi en viernes", "cerrada la apertura por API")
+
+    def shadow_open(self, sym, tf, sig, why, bar_t):
+        """Sigue como virtual una señal que NO se abre. Cuenta en los grupos del marcador solo si TODOS los motivos
+        son operativos (pausa, topes, pérdida diaria, aviso); si falla la calidad (R:R, stop...) solo alimenta 'motivo'."""
+        sh = self.state["shadow"]
+        if not C.SHADOW or sym in sh or sym in self.state["sims"] or sym in self.state["positions"]:
+            return
+        if len(sh) >= C.SHADOW_MAX_OPEN or any(k in w for w in why for k in self.NO_SHADOW):
+            return
+        labels_why = list(dict.fromkeys(norm_reason(w) for w in why))
+        sh[sym] = {**sig, "bar_t": bar_t, "half": False, "open_ts": time.time(), "nbars": 0, "why": labels_why[:4],
+                   "quality_ok": all(is_operational(x) for x in labels_why)}
+        self.save_state()
+
+    def step_shadow(self, sym, tf, t, h, l, c, atr):
+        s = self.state["shadow"].get(sym)
+        if not s or s.get("tf") != tf or t <= s["bar_t"]:
+            return
+        sim = TradeSim(s, 0, C.FEE_PCT + C.SLIPPAGE_PCT, C.TP1_FRACTION, C.MOVE_SL_TO_BE, C.TRAIL_ATR, C.TIME_STOP_BARS)
+        sim.half = s["half"]
+        sim.s = s.get("stop_now", s["entry"] if (s["half"] and C.MOVE_SL_TO_BE) else s["sl"])
+        s["nbars"] = s.get("nbars", 0) + 1
+        r = sim.step(s["nbars"], h, l, c, atr)
+        s["stop_now"] = sim.s
+        s["half"] = s["half"] or sim.half
+        reason = sim.reason
+        if r is None:
+            if time.time() - s["open_ts"] <= C.SHADOW_MAX_DAYS * 86400:
+                self._dirty = True
+                return
+            d = 1 if s["side"] == "LONG" else -1  # caduca: se valora a precio de mercado
+            risk = max(abs(s["entry"] - s["sl"]), 1e-12)
+            mtm = (c - s["entry"]) * d / risk
+            r1 = (s["tp1"] - s["entry"]) * d / risk
+            r = sim._net(C.TP1_FRACTION * r1 + (1 - C.TP1_FRACTION) * mtm if s["half"] else mtm)
+            reason = "caduca"
+        del self.state["shadow"][sym]
+        lb = s.get("labels") or labels_of(s, s["open_ts"])
+        if s.get("quality_ok"):
+            self.edge.add(lb, r, "shadow")
+        self.edge.add({"motivo": (s.get("why") or ["-"])[0]}, r, "shadow")
+        dl = self.state["daily"]
+        dl["sh_n"], dl["sh_r"] = dl.get("sh_n", 0) + 1, dl.get("sh_r", 0.0) + r
+        self.shadow_log.write({"open_time": iso(s["open_ts"]), "close_time": iso(time.time()), "symbol": sym, "tf": tf,
+                               "side": s["side"], "kind": s["kind"], "entry": s["entry"], "sl": s["sl"], "tp1": s["tp1"],
+                               "tp2": s["tp2"], "rr_plan": round(s["rr"], 2), "r_net": round(r, 3),
+                               "exit_reason": reason, "minutes": round((time.time() - s["open_ts"]) / 60),
+                               "blocked_by": " | ".join(s.get("why", [])), "counts_in_groups": int(bool(s.get("quality_ok"))),
+                               **{k: lb.get(k) for k in ("setup", "sesion", "ctx", "tendencia", "btc", "adx")}})
+        self.save_state()
+
+    def shadow_line(self):
+        if not C.SHADOW:
+            return ""
+        n, s = self.edge.totals("shadow")
+        return f"🧪 Sombra: {len(self.state['shadow'])} abiertas · {n} cerradas · {s:+.2f}R (señales que no se abrieron)\n"
+
+    def shadow_text(self):
+        n, s = self.edge.totals("shadow")
+        lines = [f"🧪 <b>Libro sombra</b>: {len(self.state['shadow'])} abiertas · {n} cerradas · {s:+.2f}R"
+                 + (f" (media {s / n:+.3f}R)" if n else "")]
+        rows = self.edge.shadow_by_reason()
+        if rows:
+            lines.append("Lo que NO se abrió, por motivo:")
+            for v, k, tot, mean, wr in rows[:10]:
+                lines.append(f"• {html.escape(v)}: {k} ops · {tot:+.2f}R · media {mean:+.2f}R · acierto {wr * 100:.0f}%")
+            lines.append("Media positiva con n grande = ese bloqueo te cuesta dinero; negativa = te protege.")
+        else:
+            lines.append("Aún no hay operaciones sombra cerradas.")
+        return "\n".join(lines)
+
     # ── universo y calentamiento ──
+    def usable(self, sym):
+        return self.paused_until.get(sym, 0.0) < time.time()
+
+    def mark_paused(self, sym, tf, e, hours=6):
+        if self.usable(sym):
+            log.info("%s pausado en BingX (%s): sin velas durante %dh", sym, tf, hours)
+        self.paused_until[sym] = time.time() + hours * 3600
+
     def refresh_universe(self, force=False):
         if not force and time.time() - self.universe_ts < C.UNIVERSE_REFRESH_H * 3600:
             return
@@ -191,7 +345,7 @@ class Bot:
         if C.SYMBOLS:
             syms = [norm(s) for s in C.SYMBOLS]
         else:
-            rows, skipped = [], {"categoría": 0, "volumen": 0, "API cerrada": 0}
+            rows, skipped = [], {"categoría": 0, "volumen": 0, "API cerrada": 0, "pausada": 0}
             vols = {t.get("symbol", ""): float(t.get("quoteVolume", 0) or 0) for t in self.ex.tickers()}
             for s, c in self.ex.contracts.items():
                 if c["cls"] not in C.CATEGORIES:
@@ -199,6 +353,9 @@ class Bot:
                     continue
                 if not c["api_open"]:
                     skipped["API cerrada"] += 1
+                    continue
+                if not self.usable(s):
+                    skipped["pausada"] += 1
                     continue
                 qv = vols.get(s, 0.0)
                 if qv < (C.MIN_QUOTE_VOL if c["cls"] == "crypto" else C.MIN_QUOTE_VOL_TRADFI):
@@ -213,7 +370,7 @@ class Bot:
                                   (f", tope {n}" if len(rows) > n else ""))
         bl = {norm(b) for b in C.BLACKLIST}
         syms = [s for s in syms if s in self.ex.contracts and s not in bl]
-        for s in list(self.state["positions"]) + list(self.state["sims"]):
+        for s in list(self.state["positions"]) + list(self.state["sims"]) + list(self.state["shadow"]):
             if s not in syms and s in self.ex.contracts:
                 syms.append(s)  # no abandonar lo que está abierto
         if C.CONTEXT_TF and "BTC-USDT" in self.ex.contracts and "BTC-USDT" not in syms and "crypto" in C.CATEGORIES:
@@ -223,8 +380,13 @@ class Bot:
         for key in list(self.engines):
             if key[0] not in syms:
                 del self.engines[key]
+                self.rows.pop(key, None)
         self.symbols = [s for s in syms if all((s, tf) in self.engines for tf in C.TIMEFRAMES)]
         self.universe_ts = time.time()
+        missing = [s for s in syms if s not in self.symbols and self.usable(s)]
+        if missing:  # fallo transitorio (p. ej. bloqueo de BingX): no esperar 6 h, reintentar en 5 min
+            self.universe_ts = time.time() - C.UNIVERSE_REFRESH_H * 3600 + 300
+            log.warning("%d símbolos sin motor (%s…): se reintenta en 5 min", len(missing), ", ".join(missing[:4]))
         log.info("universo: %d símbolos · %d motores", len(self.symbols), len(self.engines))
         by = {}
         for s in self.symbols:
@@ -239,10 +401,16 @@ class Bot:
         def fetch(job):
             s, tf = job
             n = C.WARMUP_BARS if tf in C.TIMEFRAMES else C.CONTEXT_WARMUP
+            if not self.usable(s):
+                return job, None
             try:
                 return job, self.ex.klines_history(s, tf, n + 1, tf_ms(tf))
+            except BingXPaused as e:
+                self.mark_paused(s, tf, e)
+                return job, None
             except BingXError as e:
-                log.warning("warmup %s %s: %s", s, tf, e)
+                if "bloqueada" not in str(e):
+                    log.warning("warmup %s %s: %s", s, tf, e)
                 return job, None
 
         for (s, tf), rows in self.pool.map(fetch, jobs):
@@ -260,6 +428,8 @@ class Bot:
                     eng.update(t, o, h, l, c, v)
                 last = t
         eng.last_t = last
+        if tf in C.TIMEFRAMES:
+            self.rows[(sym, tf)] = [list(r[:6]) for r in rows if r[0] + tf_ms(tf) <= cut][-ROWS_KEEP:]
         self.engines[(sym, tf)] = eng
 
     # ── filtros de contexto ──
@@ -307,18 +477,6 @@ class Bot:
             log.debug("flujo %s: %s", sym, e)
             return None, None
 
-    def edge(self, sym, tf, sig, fail, d):
-        """Ideas v5.1 (edge.py) con las mismas velas cerradas que usa el backtest. Solo registro salvo EDGE_FILTER."""
-        try:
-            ms = tf_ms(tf)
-            rows = [r for r in self.ex.klines(sym, tf, 520) if r[0] + ms <= now_ms()]
-            exc = None if fail else (d["excT"] if d["excT"] == d["excT"] else d["testT"])
-            return edge_features(rows, sig["side"], sig["atr"], sig["entry"], sig["sl"], exc, d["time"] + ms, d["rh"], d["rl"],
-                                 None if fail else d["excP"], d.get("clxT"))
-        except Exception as e:  # registro: nunca debe impedir la señal
-            log.debug("edge %s: %s", sym, e)
-            return {}
-
     def breadth(self, sym, tf, side):
         st = [wyckoff_state(e.last) for (s, t), e in self.engines.items() if t == tf and s != sym]
         if not st:
@@ -348,19 +506,32 @@ class Bot:
     def process_tf(self, tf):
         cut, ms = now_ms(), tf_ms(tf)
         # primero los símbolos con estructura en Fase C/D: son los que pueden dar entrada en esta vela
-        syms = sorted((s for s in self.symbols if (s, tf) in self.engines),
+        syms = sorted((s for s in self.symbols if (s, tf) in self.engines and self.usable(s)),
                       key=lambda s: 0 if (self.engines[(s, tf)].last or {}).get("phase", 0) in (PHASE_C, PHASE_D) else 1)
+
+        blocked = []
 
         def fetch(sym):
             try:
                 return sym, self.ex.klines(sym, tf, 6)
+            except BingXPaused as e:
+                self.mark_paused(sym, tf, e)
+                return sym, None
             except BingXError as e:
-                log.warning("klines %s %s: %s", sym, tf, e)
+                if "bloqueada" in str(e):
+                    blocked.append(str(e))
+                else:
+                    log.warning("klines %s %s: %s", sym, tf, e)
                 return sym, None
 
         trading = tf in C.TIMEFRAMES
-        watch, rebuild, failed = [], [], []
-        for sym, rows in self.pool.map(fetch, syms):
+        watch, rebuild = [], []
+        results = list(self.pool.map(fetch, syms))
+        if blocked and time.time() - self._block_alert > 600:
+            self._block_alert = time.time()
+            self.tg.send(f"⚠ BingX limita las peticiones de velas ({len(blocked)} símbolos sin datos en esta vela {tf}). "
+                         f"Se reintenta solo cuando BingX lo permita. Si se repite: menos símbolos o CATEGORIES=crypto.")
+        for sym, rows in results:
             eng = self.engines.get((sym, tf))
             if rows is None or eng is None:
                 continue
@@ -368,33 +539,34 @@ class Bot:
             if len(fresh) > 4:  # hueco grande (caída/redeploy): reconstruir
                 rebuild.append((sym, tf))
                 continue
-            try:  # v5.3: un fallo en UN símbolo no debe costar la vela de los demás
-                d = None
-                for t, o, h, l, c, v in fresh:
-                    eng.last_t = t
-                    if dead_bar(o, h, l, c, v):
-                        continue  # mercado cerrado (TradFi): no alimenta al motor
-                    d = eng.update(t, o, h, l, c, v)
-                    if trading:
-                        self.step_sim(sym, tf, t, h, l, c, d["atr"])
-                        self.manage_bar(sym, tf, c, d["atr"])
-                if d is None or not trading:
-                    continue
-                note = self.event_note(d)
-                if note:
-                    watch.append(f"{sym} {tf} {note}")
-                if d["entry_now"] and d["time"] == fresh[-1][0]:
-                    self.handle_entry(sym, tf, d)
-                elif d.get("fail") and d["time"] == fresh[-1][0] and C.FAIL_TRADES != "off":
-                    self.handle_entry(sym, tf, d, fail=True)
-            except Exception as e:
-                failed.append(sym)
-                log.error("process_tf %s %s: %s\n%s", sym, tf, e, traceback.format_exc())
+            d = None
+            for t, o, h, l, c, v in fresh:
+                eng.last_t = t
+                if trading:
+                    buf = self.rows.setdefault((sym, tf), [])
+                    buf.append([t, o, h, l, c, v])
+                    del buf[:-ROWS_KEEP]
+                if dead_bar(o, h, l, c, v):
+                    continue  # mercado cerrado (TradFi): no alimenta al motor
+                d = eng.update(t, o, h, l, c, v)
+                if trading:
+                    self.step_sim(sym, tf, t, h, l, c, d["atr"])
+                    self.step_shadow(sym, tf, t, h, l, c, d["atr"])
+                    self.manage_bar(sym, tf, c, d["atr"])
+            if d is None or not trading:
+                continue
+            note = self.event_note(d)
+            if note:
+                watch.append(f"{sym} {tf} {note}")
+            if d["entry_now"] and d["time"] == fresh[-1][0]:
+                self.handle_entry(sym, tf, d)
+            elif d.get("fail") and d["time"] == fresh[-1][0] and C.FAIL_TRADES != "off":
+                self.handle_entry(sym, tf, d, fail=True)
+        if self._dirty:
+            self.save_state()
+            self._dirty = False
         if rebuild:
             self.warmup_many(rebuild)
-        if failed:
-            self.tg.send(f"⚠ {tf}: error procesando {len(failed)} símbolo(s): {', '.join(failed[:8])} (detalle en el log). "
-                         f"El resto de la vela se procesó con normalidad.")
         if watch:
             self.tg.send("👀 <b>Eventos Wyckoff</b>\n" + "\n".join(watch[:25]))
 
@@ -421,6 +593,8 @@ class Bot:
             return
         self.cooldown[sym] = time.time()
         sig["tf"] = tf
+        buf = self.rows.get((sym, tf), [])
+        sig.update(ind_features(buf, len(buf) - 1, sig["side"], d.get("climT"), C.ADX_LEN, C.RSI_LEN))
         sig["trend"] = self.trend(sym, sig["entry"])
         cdir, clabel = self.context(sym, tf)
         sig["ctx_label"] = clabel
@@ -430,11 +604,18 @@ class Bot:
         sig["funding"], flabel = self.funding(sym)
         sig["flow"], sig["flow_exc"] = self.flow(sym, tf, sig["side"], None if fail else (
             d["excT"] if d["excT"] == d["excT"] else d["testT"]))
-        sig.update(self.edge(sym, tf, sig, fail, d))
         sig["breadth"] = self.breadth(sym, tf, sig["side"])
         sig["breadth_align"] = breadth_label(sig["breadth"])
         why = filters(sig, C, sig["trend"], alignment(sig["side"], cdir),
                       alignment(sig["side"], bdir) if blabel != "-" else "neutral")
+        sig["labels"] = labels_of(sig, time.time())
+        mute_note = ""
+        if C.EDGE_MUTE != "off":
+            mr = self.edge.muted(sig["labels"], C.EDGE_MIN_N, C.EDGE_MUTE_R, C.EDGE_MUTE_T)
+            if mr and C.EDGE_MUTE == "on":
+                why.append(mr)
+            elif mr:
+                mute_note = mr
         sig["meta_p"] = round(self.meta.prob(sig), 3) if self.meta else None
         if fail and C.FAIL_TRADES == "aviso":
             why.append("FAIL_TRADES=aviso (solo aviso, se registra para medir)")
@@ -456,9 +637,6 @@ class Bot:
                 why.append(f"TradFi en viernes ≥{C.TRADFI_NO_ENTRY_FRI_UTC}h UTC: el SL no se ejecuta con el mercado cerrado")
             if not cinfo["api_open"]:
                 why.append("BingX tiene cerrada la apertura por API")
-        sig["age_s"] = round(time.time() - (d["time"] + tf_ms(tf)) / 1000.0, 1)
-        if C.LIVE and C.MAX_SIGNAL_AGE_S > 0 and sig["age_s"] > C.MAX_SIGNAL_AGE_S:
-            why.append(f"señal con {sig['age_s']:.0f}s de retraso (> MAX_SIGNAL_AGE_S={C.MAX_SIGNAL_AGE_S}): ya no es la entrada del backtest")
         if C.LIVE:
             why += self.live_blockers(sym)
         icon = ("🪤" if fail else "") + ("🟢" if sig["side"] == "LONG" else "🔴")
@@ -475,17 +653,22 @@ class Bot:
                + (f"\n🌊 Flujo agresor {sig['flow']:+.2f}" + (f" · en el Spring/UTAD {sig['flow_exc']:+.2f}"
                                                               if sig["flow_exc"] is not None else "")
                   if sig["flow"] is not None else "")
+               + (f"\n📐 ADX {sig['adx']:.0f}" + (f" · RSI {sig['rsi_gain']:+.0f} desde el clímax" if sig["rsi_gain"] is not None else "")
+                  + f" · AVWAP {sig['avwap_align']}" if sig.get("adx") is not None else "")
                + (f"\n🧭 Amplitud Wyckoff {sig['breadth']:+.2f} ({sig['breadth_align']})" if sig["breadth"] is not None else "")
-               + (f"\n🧪 squeeze {sig['squeeze']} · ER {sig['er']} · secado {sig['dry']} · cierre {sig['clv']:+.2f}"
-                  + (f" · mecha {sig['wick_exc']}" if sig.get("wick_exc") is not None else "") + f" · {sig['session']}"
-                  if sig.get("squeeze") is not None and sig.get("er") is not None and sig.get("dry") is not None
-                  and sig.get("clv") is not None and sig.get("session") else "")
                + (f"\n🧠 Meta-modelo p={sig['meta_p']:.2f} (umbral {self.meta.thr:.2f})" if sig["meta_p"] is not None else "")
                + (f"\n🪤 Estructura rota: los del {'Spring' if sig['side'] == 'SHORT' else 'UTAD'} quedan atrapados"
                   if fail else "")
                + (f"\n⚠ contra EMA{C.TREND_EMA} {C.TREND_TF}" if sig.get("against_trend") else ""))
+        es = self.edge.summary("setup", sig["labels"]["setup"])
+        if es["n"] >= 5:
+            txt += (f"\n🧪 Marcador {html.escape(sig['labels']['setup'])}: {es['n']} ops · media {es['mean']:+.2f}R · "
+                    f"posterior {es['post']:+.2f}R")
+        if mute_note:
+            txt += f"\n⚠ {mute_note} (EDGE_MUTE=aviso: solo aviso)"
         if why:
             self.tg.send(txt + "\n⏸ <i>No se abre: " + "; ".join(dict.fromkeys(why)) + "</i>")
+            self.shadow_open(sym, tf, sig, why, d["time"])
             return
         if not C.LIVE:
             self.state["sims"][sym] = {**sig, "bar_t": d["time"], "half": False, "open_ts": time.time()}
@@ -513,6 +696,8 @@ class Bot:
         s["exit_reason"] = sim.reason
         del self.state["sims"][sym]
         self.register_result(r)
+        self.edge.add(s.get("labels") or labels_of(s, s["open_ts"]), r, "live")
+        self.save_state()
         self.journal.write({"open_time": iso(s["open_ts"]), "close_time": iso(time.time()), "symbol": sym,
                             "tf": tf, "side": s["side"], "kind": s["kind"], "entry_expected": s["entry"],
                             "entry_real": s["entry"], "sl": s["sl"], "tp1": s["tp1"], "tp2": s["tp2"],
@@ -522,8 +707,8 @@ class Bot:
                             "ctx_label": s.get("ctx_label"), "btc_align": s.get("btc_align"),
                             "funding": s.get("funding"), "range_atr": s.get("range_atr"), "b_bars": s.get("b_bars"),
                             "flow": s.get("flow"), "flow_exc": s.get("flow_exc"), "breadth": s.get("breadth"),
+                            "adx": s.get("adx"), "rsi_gain": s.get("rsi_gain"), "avwap_align": s.get("avwap_align"),
                             "meta_p": s.get("meta_p"),
-                            **{k: s.get(k) for k in EDGE_KEYS}, "risk_mult": s.get("risk_mult", 1.0), "age_s": s.get("age_s"),
                             "exit_reason": sim.reason, "mode": "SIGNAL"})
         self.tg.send(f"{'✅' if r > 0 else '❌'} Virtual {s['side']} {sym} cerrada por {sim.reason}: {r:+.2f}R "
                      f"(hoy {self.state['daily']['r']:+.2f}R · total {self.state['stats']['sum_r']:+.2f}R)")
@@ -560,18 +745,27 @@ class Bot:
         if adv > C.CHASE_MAX_R or (price - sig["sl"]) * d <= 0:
             self.tg.send(txt + f"\n⏸ No se persigue: el precio ya avanzó {adv:+.2f}R")
             return
-        mult = throttle_mult(self.state.get("rs", []), C.THROTTLE_N, C.THROTTLE_MULT)
-        sig["risk_mult"] = mult
-        qty = equity * C.RISK_PCT * mult / 100.0 / abs(price - sig["sl"])
-        qty = ex.fmt_qty(sym, min(qty, avail * C.LEVERAGE * 0.9 / price))
+        if C.NOTIONAL_USDT > 0:
+            qty = C.NOTIONAL_USDT / price  # tamaño fijo: el riesgo en USDT es ≈ NOTIONAL × distancia al stop
+        else:
+            qty = equity * C.RISK_PCT / 100.0 / abs(price - sig["sl"])
         c = ex.contracts[sym]
+        mult, mnotes = self.risk_mult(sig)
+        if mult != 1.0:  # nunca por encima del tamaño completo ni por debajo del mínimo operable
+            qmin = max(c["min_qty"], max(c["min_usdt"], 2.0) / price * 1.02)
+            qty = max(qty * mult, min(qmin, qty))
+        qty = ex.fmt_qty(sym, min(qty, avail * C.LEVERAGE * 0.9 / price))
         if qty <= 0 or qty < c["min_qty"] or qty * price < max(c["min_usdt"], 2.0):
             self.tg.send(txt + f"\n⏸ Tamaño insuficiente ({qty}) para equity {equity:.2f}")
+            return
+        if sig["risk_pct"] * C.LEVERAGE > C.MAX_LIQ_USE_PCT:
+            self.tg.send(txt + f"\n⏸ Stop a {sig['risk_pct']:.2f}% con x{C.LEVERAGE}: demasiado cerca de la liquidación "
+                               f"(MAX_LIQ_USE_PCT={C.MAX_LIQ_USE_PCT:.0f}). Baja LEVERAGE.")
             return
         ex.set_margin_mode(sym, C.MARGIN_MODE)
         ex.set_leverage(sym, C.LEVERAGE)
         cid = f"wyk{int(time.time())}{sym.split('-')[0][:6]}"
-        sent, attach_rejected = False, False
+        sent = False
         for attach in ([True, False] if self.attach_ok else [False]):
             try:
                 ex.market_open(sym, long, qty, cid + ("a" if attach else "b"), stop_loss=sig["sl"] if attach else None)
@@ -584,16 +778,13 @@ class Bot:
                     sent = True
                     break
                 if attach and not str(e).startswith("red"):
-                    log.warning("BingX rechaza la orden con SL adjunto (%s); pruebo sin adjunto solo para esta", e)
-                    attach_rejected = True  # v5.3: no se desactiva aún: puede ser margen, cantidad o límite, no el adjunto
+                    log.warning("BingX rechaza el SL adjunto (%s); se pone aparte", e)
+                    self.attach_ok = False
                     continue
                 self.tg.send(txt + f"\n❌ Orden rechazada: {e}")
                 return
         if not sent:
             return
-        if attach_rejected and self.attach_ok:  # la orden sin adjunto sí entró → el adjunto era el problema
-            self.attach_ok = False
-            log.warning("SL adjunto desactivado: la misma orden sin adjunto fue aceptada")
         pos = None
         for _ in range(8):
             time.sleep(1)
@@ -608,26 +799,135 @@ class Bot:
             return
         amt = abs(float(pos["positionAmt"]))
         entry = float(pos.get("avgPrice", price) or price)
+        plan_risk = max(abs(sig["entry"] - sig["sl"]), 1e-12)
+        slip_r = (entry - sig["entry"]) * d / plan_risk  # > 0 = entrada peor que el plan
+        if C.MAX_SLIP_R > 0 and slip_r > C.MAX_SLIP_R:
+            try:
+                ex.market_close(sym, long, amt)
+                msg = f"⏸ Relleno {slip_r:.2f}R peor que el plan (MAX_SLIP_R={C.MAX_SLIP_R}): cerrada al instante."
+            except BingXError as e:
+                msg = f"🚨 Relleno {slip_r:.2f}R peor que el plan y NO se pudo cerrar ({e}). CIERRA A MANO."
+            time.sleep(1)
+            for o in self._stops(sym, long):
+                ex.cancel(sym, o.get("orderId"))
+            self.tg.send(txt + "\n" + msg)
+            return
         rec = {**sig, "qty": amt, "entry_real": entry, "risk": abs(entry - sig["sl"]), "be": False,
                "open_ts": time.time(), "cid": cid, "sl_id": "", "tp1_id": "", "tp2_id": ""}
         if not self.ensure_sl(sym, rec, amt, at_open=True):
             return
         q1 = ex.fmt_qty(sym, amt * C.TP1_FRACTION)
         q2 = ex.fmt_qty(sym, amt - q1)
-        try:
-            if q1 > 0 and q2 > 0 and q1 >= c["min_qty"] and q2 >= c["min_qty"]:
-                rec["tp1_id"] = ex.exit_order(sym, long, "TAKE_PROFIT_MARKET", q1, sig["tp1"])
-                rec["tp2_id"] = ex.exit_order(sym, long, "TAKE_PROFIT_MARKET", q2, sig["tp2"])
-            else:
-                rec["tp2_id"] = ex.exit_order(sym, long, "TAKE_PROFIT_MARKET", amt, sig["tp2"])
-        except BingXError as e:
-            self.tg.send(f"⚠ {sym}: TP no colocado ({e}). El SL sí está puesto.")
+        split = q1 > 0 and q2 > 0 and q1 >= c["min_qty"] and q2 >= c["min_qty"]
+        err = None
+        for _ in range(3):  # reintento solo ante rechazo claro; un fallo de red podría haber creado la orden
+            try:
+                if split:
+                    if not rec["tp1_id"]:
+                        rec["tp1_id"] = ex.exit_order(sym, long, "TAKE_PROFIT_MARKET", q1, sig["tp1"])
+                    if not rec["tp2_id"]:
+                        rec["tp2_id"] = ex.exit_order(sym, long, "TAKE_PROFIT_MARKET", q2, sig["tp2"])
+                elif not rec["tp2_id"]:
+                    rec["single"] = True  # posición demasiado pequeña para partirla: una sola salida
+                    rec["tp2_id"] = ex.exit_order(sym, long, "TAKE_PROFIT_MARKET", amt,
+                                                  sig["tp1"] if C.SINGLE_TP == "tp1" else sig["tp2"])
+                err = None
+                break
+            except BingXError as e:
+                err = e
+                if str(e).startswith("red"):
+                    break
+                time.sleep(1.5)
+        if err:
+            self.tg.send(f"⚠ {sym}: TP no colocado ({err}). El SL sí está puesto; cierra o coloca el TP a mano.")
         self.state["positions"][sym] = rec
         self.save_state()
         slip = (entry - sig["entry"]) / sig["entry"] * 100 * d
-        self.tg.send(txt + f"\n✅ <b>LIVE</b> abierta {amt} @ {self.fp(entry, sym)} (desliz. {slip:+.3f}%)"
+        self.tg.send(txt + f"\n✅ <b>LIVE</b> abierta {amt} @ {self.fp(entry, sym)} · posición {amt * entry:.2f} USDT · "
+                     f"riesgo ≈ {amt * abs(entry - sig['sl']):.2f} USDT"
+                     + (" · sin TP1 parcial (tamaño mínimo)" if rec.get("single") else "") + f" (desliz. {slip:+.3f}%)"
                      + (" · SL en la orden" if self.attach_ok else "")
-                     + (f" · riesgo ×{mult} (racha en rojo)" if mult != 1.0 else ""))
+                     + (" · riesgo " + ", ".join(mnotes) if mnotes else ""))
+
+    def guard(self):
+        """Cortacircuitos de equity: si cae MAX_DD_PCT % desde su máximo, pausa las aperturas."""
+        if not C.LIVE or (C.MAX_DD_PCT <= 0 and C.MIN_EQUITY_USDT <= 0):
+            return
+        try:
+            eq, _ = self.ex.balance()
+        except BingXError as e:
+            log.warning("guard: %s", e)
+            return
+        hw = max(self.state.get("hwm", 0.0), eq)
+        if hw != self.state.get("hwm"):
+            self.state["hwm"] = hw
+            self.save_state()
+        if C.MIN_EQUITY_USDT > 0 and eq < C.MIN_EQUITY_USDT and self.state.get("pause_reason") != "piso":
+            self.pause("piso", 0, f"<b>Equity {eq:.2f} USDT por debajo del suelo ({C.MIN_EQUITY_USDT:g})</b> (MIN_EQUITY_USDT). "
+                                  f"Bot PAUSADO.")
+            return
+        dd = (hw - eq) / hw * 100 if hw > 0 else 0.0
+        if C.MAX_DD_PCT > 0 and dd >= C.MAX_DD_PCT and not self.state["paused"]:
+            self.pause("drawdown", C.DD_COOLDOWN_H,
+                       f"<b>Equity {eq:.2f} USDT: -{dd:.1f}% desde el máximo ({hw:.2f})</b> ≥ {C.MAX_DD_PCT}%. Bot PAUSADO. "
+                       f"Si has retirado fondos usa /hwm.")
+
+    def weekend_close(self):
+        """Viernes tarde: CIERRA las TradFi abiertas (con el mercado cerrado el SL no se ejecuta y el lunes hay gap)."""
+        n = datetime.now(timezone.utc)
+        if not (C.LIVE and C.TRADFI_CLOSE_FRI_UTC >= 0 and n.weekday() == 4 and n.hour >= C.TRADFI_CLOSE_FRI_UTC):
+            return
+        for sym, rec in list(self.state["positions"].items()):
+            if not is_tradfi(sym) or rec.get("wk_tries", 0) >= 3:
+                continue
+            long = rec["side"] == "LONG"
+            rec["wk_tries"] = rec.get("wk_tries", 0) + 1
+            try:
+                pos = self.find_pos(sym, long)
+                if pos is None:
+                    continue
+                self.ex.market_close(sym, long, abs(float(pos["positionAmt"])))
+                rec["force_reason"] = "fin de semana"
+                self.save_state()
+                self.tg.send(f"📆 {sym}: cerrada a mercado antes del fin de semana (TRADFI_CLOSE_FRI_UTC={C.TRADFI_CLOSE_FRI_UTC}).")
+            except BingXError as e:
+                self.tg.send(f"⚠ {sym}: no se pudo cerrar antes del fin de semana ({e}). Intento {rec['wk_tries']}/3; "
+                             f"si falla, ciérrala a mano.")
+
+    def manual_close(self, which):
+        if not C.LIVE:
+            return "Modo SIGNAL: no hay posiciones reales."
+        w = which.upper().replace("-USDT", "").replace("USDT", "")
+        syms = [s for s in self.state["positions"] if which == "all" or s.split("-")[0] == w]
+        if not syms:
+            return "No hay posiciones del bot que coincidan."
+        out = []
+        for sym in syms:
+            rec = self.state["positions"][sym]
+            long = rec["side"] == "LONG"
+            try:
+                pos = self.find_pos(sym, long)
+                if pos is None:
+                    out.append(f"{sym}: ya no estaba abierta")
+                    continue
+                self.ex.market_close(sym, long, abs(float(pos["positionAmt"])))
+                rec["force_reason"] = "manual (Telegram)"
+                self.save_state()
+                out.append(f"{sym}: cierre a mercado enviado")
+            except BingXError as e:
+                out.append(f"{sym}: ERROR {e} → ciérrala a mano")
+        return "🧯 " + "\n".join(out)
+
+    def real_r(self, sym, rec):
+        """R neta con el PnL real (realizado + comisiones + funding) del libro de ingresos de BingX."""
+        try:
+            tot = self.ex.realized_pnl(sym, int(rec["open_ts"] * 1000) - 60_000)
+        except BingXError as e:
+            log.warning("income %s: %s", sym, e)
+            return None
+        if tot is None:
+            return None
+        return tot / max(rec["qty"] * rec["risk"], 1e-12)
 
     def manage_bar(self, sym, tf, c, atr):
         """Al cierre de cada vela del TF de la posición: salida por tiempo y trailing tras TP1 (si están activos)."""
@@ -735,8 +1035,12 @@ class Bot:
                 log.warning("manage %s: %s", sym, e)
                 continue
             if pos is None:
-                self.close_record(sym, rec)
+                # una lectura vacía puntual de la API NO puede cancelar el SL de una posición viva
+                rec["gone"] = rec.get("gone", 0) + 1
+                if rec["gone"] >= C.GONE_CONFIRMS:
+                    self.close_record(sym, rec)
                 continue
+            rec["gone"] = 0
             amt = abs(float(pos["positionAmt"]))
             if not rec.get("half") and amt <= rec["qty"] * (1 - C.TP1_FRACTION) * 1.02:
                 rec["half"] = True
@@ -766,7 +1070,7 @@ class Bot:
         px_tp2 = self.order_fill(sym, rec.get("tp2_id"))
         px_sl = self.order_fill(sym, rec.get("sl_id"))
         if px_tp2:
-            exit_px, reason = px_tp2, "TP2"
+            exit_px, reason = px_tp2, ("TP (salida única)" if rec.get("single") else "TP2")
         elif px_sl:
             exit_px, reason = px_sl, ("trailing" if rec.get("trail_stop") else "BE" if rec.get("be") else "SL")
         else:
@@ -778,6 +1082,11 @@ class Bot:
         r_exit = (exit_px - e) * d / risk
         r = (f * r1 + (1 - f) * r_exit) if rec.get("half") else r_exit
         r -= 2.0 * C.FEE_PCT / 100.0 * e / risk
+        real = self.real_r(sym, rec) if C.REAL_PNL else None
+        if real is not None:
+            if abs(real - r) > 0.3:
+                self.tg.send(f"ℹ {sym}: R estimada {r:+.2f} vs R real de la cuenta {real:+.2f} (se usa la real)")
+            r = real
         for oid in (rec.get("sl_id"), rec.get("tp1_id"), rec.get("tp2_id")):
             if oid:
                 ex.cancel(sym, oid)  # no dejar órdenes huérfanas
@@ -788,6 +1097,8 @@ class Bot:
             pass
         del self.state["positions"][sym]
         self.register_result(r)
+        self.edge.add(rec.get("labels") or labels_of(rec, rec["open_ts"]), r, "live")
+        self.save_state()
         mins = (time.time() - rec["open_ts"]) / 60
         self.journal.write({"open_time": iso(rec["open_ts"]), "close_time": iso(time.time()), "symbol": sym,
                             "tf": rec.get("tf"), "side": rec["side"], "kind": rec["kind"],
@@ -800,9 +1111,8 @@ class Bot:
                             "btc_align": rec.get("btc_align"), "funding": rec.get("funding"),
                             "range_atr": rec.get("range_atr"), "b_bars": rec.get("b_bars"),
                             "flow": rec.get("flow"), "flow_exc": rec.get("flow_exc"), "breadth": rec.get("breadth"),
-                            "meta_p": rec.get("meta_p"),
-                            **{k: rec.get(k) for k in EDGE_KEYS}, "risk_mult": rec.get("risk_mult", 1.0), "age_s": rec.get("age_s"),
-                            "mode": "LIVE"})
+                            "adx": rec.get("adx"), "rsi_gain": rec.get("rsi_gain"), "avwap_align": rec.get("avwap_align"),
+                            "meta_p": rec.get("meta_p"), "mode": "LIVE"})
         self.tg.send(f"{'✅' if r > 0 else '❌'} {rec['side']} {sym} cerrada por {reason}: {r:+.2f}R "
                      f"en {mins:.0f} min (hoy {self.state['daily']['r']:+.2f}R)")
 
@@ -820,19 +1130,35 @@ class Bot:
             self.tg.send(f"⚠ reconcile: no se pudo leer posiciones ({e})")
             return
         for sym, rec in list(self.state["positions"].items()):
-            if self.find_pos(sym, rec["side"] == "LONG") is None:
+            try:
+                gone = self.find_pos(sym, rec["side"] == "LONG") is None
+            except BingXError as e:
+                log.warning("reconcile %s: %s", sym, e)
+                continue
+            if gone:
                 self.close_record(sym, rec)
-        # órdenes huérfanas de despliegues anteriores (marcadas con prefijo wyk)
+        # órdenes huérfanas: SOLO en símbolos sin posición real (nunca tocar el SL/TP de una posición viva)
+        live_syms = {p.get("symbol") for p in allpos}
+        stateless = set()
         try:
             n = 0
             for o in self.ex.open_orders():
                 cid = str(o.get("clientOrderId", o.get("clientOrderID", "")))
-                if cid.startswith("wyk") and o.get("symbol") not in self.state["positions"]:
-                    n += self.ex.cancel(o.get("symbol"), o.get("orderId"))
+                s = o.get("symbol")
+                if not cid.startswith("wyk"):
+                    continue
+                if s in live_syms:
+                    if s not in self.state["positions"]:
+                        stateless.add(s)
+                else:
+                    n += self.ex.cancel(s, o.get("orderId"))
             if n:
                 self.tg.send(f"🧹 Canceladas {n} órdenes huérfanas de un despliegue anterior.")
         except BingXError as e:
             log.warning("limpieza de huérfanas: %s", e)
+        if stateless:
+            self.tg.send(f"🚨 Posición(es) del bot SIN estado guardado (¿falta el volumen /data?): {', '.join(sorted(stateless))}. "
+                         f"Conservan sus órdenes en BingX pero el bot ya no las gestiona (TP1→BE, cierre). Revísalas a mano.")
         foreign = [p["symbol"] for p in allpos if p["symbol"] not in self.state["positions"]]
         if foreign:
             self.tg.send(f"ℹ En la cuenta hay {len(foreign)} posición(es) ajenas a este bot: {', '.join(foreign[:10])}. "
@@ -864,15 +1190,42 @@ class Bot:
             elif c == "/stats":
                 self.tg.send(f"📈 {self.stats_text()}\nHoy {self.state['daily']['r']:+.2f}R ({self.state['daily']['n']} ops)")
             elif c == "/pausa":
-                self.state["paused"] = True
-                self.save_state()
+                self._set_pause("manual", 0)
                 self.tg.send("⏸ Pausado: no se abren operaciones nuevas. Las abiertas se siguen gestionando.")
             elif c == "/reanudar":
-                self.state["paused"] = False
+                self.state["paused"], self.state["streak"] = False, 0
+                self.state["pause_until"], self.state["pause_reason"] = 0.0, ""
+                self.state["recovery"] = {"left": 0, "wins": 0}
+                try:
+                    if C.LIVE:
+                        self.state["hwm"] = self.ex.balance()[0]  # el cortacircuitos vuelve a medir desde hoy
+                except BingXError:
+                    pass
                 self.save_state()
-                self.tg.send("▶ Reanudado.")
+                self.tg.send("▶ Reanudado (racha y máximo de equity reiniciados).")
+            elif c == "/sombra":
+                self.tg.send(self.shadow_text())
+            elif c == "/edge":
+                self.tg.send(self.edge.report())
+            elif c == "/hwm":
+                try:
+                    self.state["hwm"] = self.ex.balance()[0]
+                    self.save_state()
+                    self.tg.send(f"Máximo de equity reiniciado a {self.state['hwm']:.2f} USDT.")
+                except BingXError as e:
+                    self.tg.send(f"No se pudo leer el equity: {e}")
+            elif c == "/cerrar":
+                args = cmd.split()[1:]
+                self.tg.send(self.manual_close(args[0]) if args else "Uso: /cerrar BTC")
+            elif c == "/cerrartodo":
+                args = cmd.split()[1:]
+                if args and args[0].upper() in ("SI", "SÍ"):
+                    self._set_pause("manual", 0)
+                    self.tg.send("⏸ Pausado.\n" + self.manual_close("all"))
+                else:
+                    self.tg.send("⚠ Cierra TODAS las posiciones del bot a mercado y pausa. Confirma con: /cerrartodo SI")
             else:
-                self.tg.send("Comandos: /estado /posiciones /stats /pausa /reanudar")
+                self.tg.send("Comandos: /estado /posiciones /stats /sombra /edge /pausa /reanudar /cerrar BTC /cerrartodo SI /hwm")
 
     def positions_text(self):
         lines = []
@@ -904,10 +1257,11 @@ class Bot:
                 cdir, clabel = self.context(sym, tf)
                 prep.append(f"{sym} {tf}: {eng.status_text()} · ctx {clabel}")
         dist = " · ".join(f"{PHASE_NAMES[k]}:{v}" for k, v in sorted(counts.items()) if k)
-        self.tg.send(f"📊 <b>Estado</b>{' ⏸ PAUSADO' if self.state['paused'] else ''} · {len(self.symbols)} símbolos"
+        self.tg.send(f"📊 <b>Estado</b>{self.pause_label()}{self.recovery_label()} · {len(self.symbols)} símbolos"
                      f" · fases {dist or 'ninguna activa'}\n"
                      f"Abiertas: {len(self.state['positions'])} live · {len(self.state['sims'])} virtuales\n"
                      f"Hoy {self.state['daily']['r']:+.2f}R · {self.stats_text()}\n"
+                     + self.shadow_line()
                      + ("\n".join(["Preparando:"] + prep[:15]) if prep else "Ninguna estructura en Fase C/D"))
         if C.LIVE and time.time() - self.state["last_trade"] > C.IDLE_ALERT_DAYS * 86400 and not self.state["idle_warned"]:
             self.state["idle_warned"] = True
@@ -922,35 +1276,48 @@ class Bot:
         if C.LIVE and not (C.API_KEY and C.API_SECRET):
             self.tg.send("❌ LIVE sin BINGX_API_KEY/SECRET. Parado.")
             return
+        if C.LIVE:
+            if not os.path.ismount(C.DATA_DIR):
+                self.tg.send(f"⚠ {C.DATA_DIR} no es un volumen persistente: el estado (posiciones, TP1→BE) se pierde en cada "
+                             f"despliegue. Monta un volumen en /data antes de operar con dinero real.")
+            try:
+                eq, av = self.ex.balance()
+            except BingXError as e:
+                self.tg.send(f"❌ LIVE: no se puede leer el balance ({e}). Revisa la API key (permisos de Futuros/Trade) y su lista de IPs. Parado.")
+                return
+            if not self.state.get("hwm"):
+                self.state["hwm"] = eq
+                self.save_state()
+            self.tg.send(f"💰 Cuenta {'VST (demo)' if C.VST else 'REAL'}: equity {eq:.2f} USDT · disponible {av:.2f} · "
+                         f"{('posición fija ' + format(C.NOTIONAL_USDT, 'g') + ' USDT') if C.NOTIONAL_USDT > 0 else ('riesgo/operación ≈ %.2f USDT' % (eq * C.RISK_PCT / 100))} · pausa si cae {C.MAX_DD_PCT}% o {C.MAX_LOSS_STREAK} pérdidas seguidas")
         t0 = time.time()
         self.refresh_universe(force=True)
         self.reconcile()
         self.tg.send(f"✅ {len(self.engines)} estructuras reconstruidas ({len(self.symbols)} símbolos × "
                      f"{'/'.join(ALL_TFS)}) en {time.time() - t0:.0f}s.")
         next_close = {tf: (now_ms() // tf_ms(tf) + 1) * tf_ms(tf) for tf in ALL_TFS}
-        last_manage = last_cmd = 0
+        last_manage = last_cmd = last_guard = 0
         while self.running:
             try:
                 self.roll_day()
                 self.weekend_watch()
                 due = [tf for tf in ALL_TFS if now_ms() >= next_close[tf] + C.CANDLE_DELAY_S * 1000]
+                if not due:
+                    self.refresh_universe()  # se auto-limita por universe_ts; así el reintento de 5 min ocurre entre velas
                 if due:
                     self.refresh_universe()
                     for tf in sorted(due, key=C.tf_seconds, reverse=True):  # contexto antes que entradas
-                        t_cycle = time.time()
                         self.process_tf(tf)
-                        took = time.time() - t_cycle
-                        log.info("ciclo %s: %.1fs · %d símbolos", tf, took, len(self.symbols))
-                        if took > 0.4 * C.tf_seconds(tf) and time.time() - self.state.get("slow_warned", 0) > 6 * 3600:
-                            self.state["slow_warned"] = time.time()
-                            self.tg.send(f"🐢 El ciclo de {tf} tarda {took:.0f}s ({took / C.tf_seconds(tf):.0%} de la vela) con "
-                                         f"{len(self.symbols)} símbolos: las señales llegan tarde. Baja MAX_SYMBOLS/UNIVERSE, "
-                                         f"sube BINGX_MAX_RPS (máx. ~40) o usa un TF más alto.")
                         next_close[tf] = (now_ms() // tf_ms(tf) + 1) * tf_ms(tf)
                     self.status()
                 if time.time() - last_manage >= C.MANAGE_EVERY_S:
                     self.manage()
                     last_manage = time.time()
+                if time.time() - last_guard >= 60:
+                    self.maybe_resume()
+                    self.guard()
+                    self.weekend_close()
+                    last_guard = time.time()
                 if time.time() - last_cmd >= 3:
                     self.commands()
                     last_cmd = time.time()
@@ -961,11 +1328,29 @@ class Bot:
             time.sleep(1)
 
 
+def preflight():
+    """python main.py --preflight → comprueba claves, permisos y cuenta SIN enviar ninguna orden."""
+    ex, ok = BingX(C.API_KEY, C.API_SECRET, C.VST), True
+    print(f"{C.CODE_VERSION}\n{C.summary()}\ncuenta: {'VST (demo)' if C.VST else 'REAL'}")
+    for name, fn in (("contratos", lambda: f"{len(ex.load_contracts())} perpetuos USDT"),
+                     ("balance", lambda: "equity %.2f · disponible %.2f" % ex.balance()),
+                     ("modo de posición", lambda: "Hedge" if ex.hedge_mode() else "One-Way"),
+                     ("posiciones abiertas", lambda: ", ".join(p["symbol"] for p in ex.positions()) or "ninguna"),
+                     ("órdenes abiertas", lambda: str(len(ex.open_orders())))):
+        try:
+            print(f"  ✓ {name}: {fn()}")
+        except Exception as e:
+            ok = False
+            print(f"  ✗ {name}: {e}")
+    print("MODE=%s CONFIRM_LIVE=%s → %s" % (C.MODE, C.CONFIRM_LIVE, "operará con órdenes REALES" if C.LIVE else "solo SIGNAL"))
+    print("Telegram:", "configurado" if (C.TG_TOKEN and C.TG_CHAT) else "SIN configurar (no habrá avisos)")
+    print("Volumen persistente en %s: %s" % (C.DATA_DIR, "sí" if os.path.ismount(C.DATA_DIR) else "NO"))
+    return 0 if ok else 1
+
+
 def main():
-    if os.getenv("RUN_MODE", "").strip().strip('"').lower() == "research":
-        import research  # servicio de investigación: backtest + sweep + meta, resultados a Telegram
-        research.run()
-        return
+    if "--preflight" in sys.argv:
+        return preflight()
     log.info("%s | %s", C.CODE_VERSION, C.summary())
     bot = Bot()
 
@@ -979,4 +1364,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

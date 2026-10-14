@@ -1,7 +1,7 @@
 """Configuración desde variables de entorno. Todos los parsers quitan comillas (lección de Railway)."""
 import os
 
-CODE_VERSION = "wyckoff-bot 5.3.0 (2026-10-02)"
+CODE_VERSION = "wyckoff-bot 4.5.0-live (2026-10-13)"
 
 
 def _raw(name, default):
@@ -54,7 +54,7 @@ TG_TOKEN = _s("TELEGRAM_TOKEN", "") or _s("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = _s("TELEGRAM_CHAT_ID", "")
 
 # ── Universo ──
-TIMEFRAMES = [x.strip().lower() for x in _s("TIMEFRAMES", _s("TIMEFRAME", "1h")).split(",") if x.strip()]
+TIMEFRAMES = [x.strip().lower() for x in _s("TIMEFRAMES", _s("TIMEFRAME", "15m")).split(",") if x.strip()]
 TIMEFRAME = TIMEFRAMES[0]                        # compatibilidad
 SYMBOLS = _list("SYMBOLS", "")                   # vacío = automático
 UNIVERSE = _s("UNIVERSE", "all").lower()         # all = todos los perpetuos · top = los AUTO_TOP_N con más volumen
@@ -83,7 +83,7 @@ else:
 # ── Plan y filtros (los del indicador v2) ──
 SL_BUFFER_ATR = _f("SL_BUFFER_ATR", 0.25)
 MIN_RR = _f("MIN_RR", 1.5)                       # R:R mínimo hasta TP2 (0 = sin filtro)
-TREND_FILTER = _s("TREND_FILTER", "bloquea").lower()  # off | aviso | bloquea (v5: bloquea, ver README "Evidencia")
+TREND_FILTER = _s("TREND_FILTER", "aviso").lower()  # off | aviso | bloquea
 TREND_TF = _s("TREND_TF", "1h")
 TREND_EMA = _i("TREND_EMA", 50)
 CONTEXT_TF = _s("CONTEXT_TF", "4h").lower()      # estructura Wyckoff de TF superior (vacío = sin contexto)
@@ -99,41 +99,70 @@ TIME_STOP_BARS = _i("TIME_STOP_BARS", 0)        # cierra si en N velas no toca T
 BTC_FILTER = _s("BTC_FILTER", "aviso").lower()  # off | aviso | bloquea: estructura de BTC en CONTEXT_TF (solo cripto)
 MAX_SAME_SIDE = _i("MAX_SAME_SIDE", 0)          # máx. posiciones en la misma dirección (0 = sin tope)
 # ── v4: ideas nuevas ──
-FAIL_TRADES = _s("FAIL_TRADES", "off").lower()  # off | aviso | on: operar a los atrapados cuando la estructura se rompe
+FAIL_TRADES = _s("FAIL_TRADES", "aviso").lower()  # off | aviso | on: operar a los atrapados cuando la estructura se rompe
 FAIL_SL_ATR = _f("FAIL_SL_ATR", 1.0)              # stop de la trampa: nivel duro ± X×ATR
 FAIL_NEEDS_ENTRY = _b("FAIL_NEEDS_ENTRY", False)  # true = solo estructuras que llegaron a dar entrada
 FLOW_SOURCE = _s("FLOW_SOURCE", "binance").lower() # binance | off: compra/venta agresora (no hay en BingX)
 BREADTH_FILTER = _s("BREADTH_FILTER", "aviso").lower()  # off | aviso | bloquea: amplitud Wyckoff en contra
 META_MODEL = _s("META_MODEL", "meta_model.json")  # modelo entrenado con meta.py --guardar
-META_FILTER = _s("META_FILTER", "off").lower()  # off | aviso | bloquea (bloquea por debajo del umbral)
-# ── v5.1: laboratorio de ideas nuevas (edge.py). Todo OFF hasta que `sweep.py --modo edge` lo avale ──
-EDGE_FILTER = _s("EDGE_FILTER", "off").lower()  # off | bloquea (aplica EDGE_RULES)
-EDGE_RULES = _s("EDGE_RULES", "")                # ej. "squeeze<0.8,clv>0" (AND). Claves: squeeze er dry clv body wick_exc vol_exc risk_atr vr atr_pct depth confirm avwap fund_h session dow
-THROTTLE_N = _i("THROTTLE_N", 0)                 # acelerador de capital: mira las últimas N operaciones (0 = off)
-THROTTLE_MULT = _f("THROTTLE_MULT", 0.5)         # riesgo × esto si esas N suman < 0 R
+META_FILTER = _s("META_FILTER", "aviso").lower()  # off | aviso | bloquea (bloquea por debajo del umbral)
 ATTACH_SL = _b("ATTACH_SL", True)               # SL dentro de la orden de entrada (sin ventana desnuda)
 MOVE_SL_TO_BE = _b("MOVE_SL_TO_BE", True)
 
 # ── Riesgo ──
 RISK_PCT = _f("RISK_PCT", 0.5)                   # % del equity arriesgado por operación
 LEVERAGE = _i("LEVERAGE", 5)
+NOTIONAL_USDT = _f("NOTIONAL_USDT", 0.0)         # >0 = tamaño FIJO de posición en USDT (ignora RISK_PCT). 0 = tamaño por riesgo
+SINGLE_TP = _s("SINGLE_TP", "tp1").lower()       # si la posición es tan pequeña que no se puede partir en TP1/TP2: sale entera en tp1 | tp2
 MARGIN_MODE = _s("MARGIN_MODE", "ISOLATED").upper()
 MAX_CONCURRENT = _i("MAX_CONCURRENT", 2)         # posiciones de ESTE bot
 MAX_TOTAL_POSITIONS = _i("MAX_TOTAL_POSITIONS", 4)  # posiciones de TODA la cuenta (otros bots y manuales)
 MAX_DAILY_LOSS_R = _f("MAX_DAILY_LOSS_R", 3.0)
+# ── v4.3: complementos de precisión (off | aviso = solo registra | bloquea). Se activan SOLO si el sweep los valida ──
+ADX_FILTER = _s("ADX_FILTER", "aviso").lower()    # bloquea si ADX > ADX_MAX (reversión contra tendencia fuerte)
+ADX_MAX = _f("ADX_MAX", 30.0)
+ADX_LEN = _i("ADX_LEN", 14)
+DIV_FILTER = _s("DIV_FILTER", "aviso").lower()    # bloquea si el RSI no ha perdido fuerza desde el clímax
+DIV_MIN = _f("DIV_MIN", 5.0)
+RSI_LEN = _i("RSI_LEN", 14)
+AVWAP_FILTER = _s("AVWAP_FILTER", "aviso").lower()  # bloquea si el precio está en contra del VWAP anclado al clímax
+# ── v4.1: cortacircuitos para dinero real (todos pausan las aperturas; lo abierto se sigue gestionando) ──
+MAX_DD_PCT = _f("MAX_DD_PCT", 8.0)                # caída del equity desde su máximo (%) → pausa hasta /reanudar (0 = off)
+MAX_LOSS_STREAK = _i("MAX_LOSS_STREAK", 5)        # pérdidas seguidas → pausa hasta /reanudar (0 = off)
+MAX_SLIP_R = _f("MAX_SLIP_R", 0.35)               # si el relleno real es peor que el plan en más de X R, se cierra al instante (0 = off)
+MAX_LIQ_USE_PCT = _f("MAX_LIQ_USE_PCT", 60.0)     # riesgo_stop% × apalancamiento no puede pasar de esto (el stop debe quedar lejos de la liquidación)
+# ── v4.5: anti-parada, libro sombra y marcador bayesiano de ventaja ──
+AUTO_RESUME = _b("AUTO_RESUME", True)             # las pausas por racha / drawdown se levantan solas tras un enfriamiento
+STREAK_COOLDOWN_H = _f("STREAK_COOLDOWN_H", 3.0)  # horas de pausa tras MAX_LOSS_STREAK
+DD_COOLDOWN_H = _f("DD_COOLDOWN_H", 12.0)         # horas de pausa tras MAX_DD_PCT (al reanudar, el máximo de equity se reinicia)
+RECOVERY_MULT = _f("RECOVERY_MULT", 0.5)          # tras reanudar sola: riesgo × esto...
+RECOVERY_WINS = _i("RECOVERY_WINS", 1)            # ...hasta conseguir N ganadoras...
+RECOVERY_MAX_TRADES = _i("RECOVERY_MAX_TRADES", 4)  # ...o como mucho N operaciones
+AUTO_RESUME_MAX_7D = _i("AUTO_RESUME_MAX_7D", 3)  # tras N reanudaciones automáticas en 7 días, la siguiente pausa es manual
+MIN_EQUITY_USDT = _f("MIN_EQUITY_USDT", 0.0)      # suelo duro: por debajo de este equity, pausa SOLO manual (0 = off)
+SHADOW = _b("SHADOW", True)                       # libro sombra: sigue como virtuales las señales que no se abren
+SHADOW_MAX_OPEN = _i("SHADOW_MAX_OPEN", 60)       # tope de operaciones sombra abiertas a la vez
+SHADOW_MAX_DAYS = _f("SHADOW_MAX_DAYS", 5.0)      # una sombra sin resolver se cierra a precio de mercado tras N días
+EDGE_PRIOR_N = _f("EDGE_PRIOR_N", 20.0)           # peso del a priori (en operaciones) del marcador bayesiano
+EDGE_PRIOR_MEAN_R = _f("EDGE_PRIOR_MEAN_R", 0.0)  # media R a priori (0 = sin ventaja hasta que los datos digan lo contrario)
+EDGE_MUTE = _s("EDGE_MUTE", "aviso").lower()      # off | aviso | on: silencia setups/sesiones con ventaja claramente negativa
+EDGE_MIN_N = _i("EDGE_MIN_N", 20)                 # operaciones mínimas del grupo para poder silenciarlo
+EDGE_MUTE_R = _f("EDGE_MUTE_R", 0.15)             # media posterior por debajo de -X R...
+EDGE_MUTE_T = _f("EDGE_MUTE_T", 1.5)              # ...y t-estadístico ≤ -X
+EDGE_SIZING = _s("EDGE_SIZING", "off").lower()    # off | on: riesgo × (1 + K·media posterior del setup), acotado
+EDGE_SIZING_K = _f("EDGE_SIZING_K", 1.0)
+EDGE_MULT_MIN = _f("EDGE_MULT_MIN", 0.5)
+EDGE_MULT_MAX = _f("EDGE_MULT_MAX", 1.25)
+TRADFI_CLOSE_FRI_UTC = _i("TRADFI_CLOSE_FRI_UTC", 20)  # viernes desde esta hora UTC CIERRA las TradFi abiertas (-1 = off)
+GONE_CONFIRMS = _i("GONE_CONFIRMS", 2)            # ciclos seguidos sin ver la posición antes de darla por cerrada
+REAL_PNL = _b("REAL_PNL", True)                   # R de cada cierre calculada con el PnL real de la cuenta (income de BingX)
 FEE_PCT = _f("FEE_PCT", 0.05)                    # comisión por lado (%) para R neta
 SLIPPAGE_PCT = _f("SLIPPAGE_PCT", 0.03)          # deslizamiento por lado (%) que descuenta el backtest
-
-# ── v5.3: límites de BingX (oficial: datos de mercado 500 peticiones/10 s por IP; órdenes 10/s, cuenta 5-10/s) ──
-BINGX_MAX_RPS = _f("BINGX_MAX_RPS", 30)          # datos públicos/s (tope real 50/s por IP; deja margen para otros bots en la misma IP)
-BINGX_TRADE_RPS = _f("BINGX_TRADE_RPS", 5)       # peticiones firmadas (cuenta/órdenes) por segundo
-MAX_SIGNAL_AGE_S = _i("MAX_SIGNAL_AGE_S", 180)   # LIVE: no abre si la señal tiene más de N s desde el cierre de la vela (0 = off)
 
 # ── Operativa ──
 CANDLE_DELAY_S = _i("CANDLE_DELAY_S", 8)         # espera tras el cierre de vela
 MANAGE_EVERY_S = _i("MANAGE_EVERY_S", 30)
 SIGNAL_COOLDOWN_MIN = _i("SIGNAL_COOLDOWN_MIN", 60)
-VERDICT_EVERY = _i("VERDICT_EVERY", 20)          # cada N operaciones cerradas: veredicto estadístico en Telegram
 STATUS_EVERY_H = _f("STATUS_EVERY_H", 12)
 ZOMBIE_ALERT_HOURS = _f("ZOMBIE_ALERT_HOURS", 72)
 IDLE_ALERT_DAYS = _f("IDLE_ALERT_DAYS", 7)
@@ -152,5 +181,6 @@ def tf_seconds(tf):
 def summary():
     return (f"modo {'LIVE' if LIVE else 'SIGNAL'}{' (VST)' if VST else ''} · TF {','.join(TIMEFRAMES)} · contexto {CONTEXT_TF or '-'} ({CONTEXT_FILTER})"
             f" · exigencia {ENTRY_STRICTNESS}"
-            f" · riesgo {RISK_PCT}% · x{LEVERAGE} {MARGIN_MODE} · máx {MAX_CONCURRENT} (cuenta {MAX_TOTAL_POSITIONS})"
-            f" · R:R≥{MIN_RR} · tendencia {TREND_FILTER} {TREND_TF}")
+            f" · {(f'posición fija {NOTIONAL_USDT:g} USDT' if NOTIONAL_USDT > 0 else f'riesgo {RISK_PCT}%')} · x{LEVERAGE} {MARGIN_MODE} · máx {MAX_CONCURRENT} (cuenta {MAX_TOTAL_POSITIONS})"
+            f" · R:R≥{MIN_RR} · tendencia {TREND_FILTER} {TREND_TF}"
+            f" · pausa {'auto ' + format(STREAK_COOLDOWN_H, 'g') + 'h' if AUTO_RESUME else 'manual'} · sombra {'on' if SHADOW else 'off'}")

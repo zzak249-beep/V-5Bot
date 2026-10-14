@@ -67,27 +67,31 @@ class Telegram:
         return out
 
 
+SHADOW_FIELDS = ["open_time", "close_time", "symbol", "tf", "side", "kind", "entry", "sl", "tp1", "tp2", "rr_plan",
+                 "r_net", "exit_reason", "minutes", "blocked_by", "counts_in_groups", "setup", "sesion", "ctx",
+                 "tendencia", "btc", "adx"]
+
+
 class Journal:
     FIELDS = ["open_time", "close_time", "symbol", "tf", "side", "kind", "entry_expected", "entry_real", "slippage_pct",
               "sl", "tp1", "tp2", "rr_plan", "qty", "exit_reason", "r_net", "minutes", "conf", "val",
-              "against_trend", "ctx_align", "ctx_label", "btc_align", "funding", "range_atr", "b_bars", "flow", "flow_exc", "breadth", "meta_p",
-              "squeeze", "er", "dry", "clv", "body", "wick_exc", "vol_exc", "risk_atr", "session", "dow",
-              "vr", "atr_pct", "depth", "confirm", "avwap", "fund_h", "risk_mult", "age_s", "mode"]
+              "against_trend", "ctx_align", "ctx_label", "btc_align", "funding", "range_atr", "b_bars", "flow", "flow_exc", "breadth", "adx", "rsi_gain", "avwap_align", "meta_p", "mode"]
 
-    def __init__(self, data_dir):
-        self.path = os.path.join(data_dir, "journal.csv")
+    def __init__(self, data_dir, name="journal.csv", fields=None):
+        self.fields = list(fields or self.FIELDS)
+        self.path = os.path.join(data_dir, name)
         if os.path.exists(self.path):
             with open(self.path) as f:
                 head = f.readline().strip().split(",")
-            if head != self.FIELDS:  # diario de una versión anterior: se conserva aparte
+            if head != self.fields:  # diario de una versión anterior: se conserva aparte
                 os.replace(self.path, self.path.replace(".csv", f"_v1_{int(time.time())}.csv"))
         if not os.path.exists(self.path):
             with open(self.path, "w", newline="") as f:
-                csv.writer(f).writerow(self.FIELDS)
+                csv.writer(f).writerow(self.fields)
 
     def write(self, row):
         try:
             with open(self.path, "a", newline="") as f:
-                csv.DictWriter(f, fieldnames=self.FIELDS, extrasaction="ignore").writerow(row)
+                csv.DictWriter(f, fieldnames=self.fields, extrasaction="ignore").writerow(row)
         except OSError as e:
             log.error("journal: %s", e)
